@@ -103,6 +103,7 @@ Once running, it will appear in your taskbar and as one tray icon in the notific
 - Drag the left divider to move the taskbar widget
 - Choose **Settings → Pin to the left edge of the taskbar** to keep the widget at the left edge instead of next to the tray
 - On multi-monitor setups, choose **Settings → Display** from the right-click menu or drag the widget onto another taskbar. The selection is saved; the primary taskbar is used while the selected display is disconnected, and the widget returns when it reconnects.
+- A rejected display change keeps the previous taskbar and shows an error. Automatic placement accounts for notification-area and secondary-taskbar clock controls; see [placement troubleshooting](docs/troubleshooting.md#widget-disappears-after-a-display-change-or-covers-the-clock) if a taskbar layout still needs adjustment.
 - Right-click the taskbar widget or tray icon for refresh, monitored services, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in

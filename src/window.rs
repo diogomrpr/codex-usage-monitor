@@ -892,6 +892,14 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         taskbar.rect.bottom
     ));
 
+    // SetParent can fail (for example, Explorer may be restarting). Keep the
+    // working attachment and its hook until the native operation succeeds.
+    suppress_tray_reposition_for(Duration::from_millis(500));
+    if let Err(error) = native_interop::embed_in_taskbar(hwnd, taskbar.hwnd) {
+        diagnose::log(format!("taskbar attachment failed: {error}"));
+        return false;
+    }
+
     let old_hook = {
         let mut state = lock_state();
         state.as_mut().and_then(|s| s.win_event_hook.take())
@@ -900,8 +908,6 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         native_interop::unhook_win_event(hook);
     }
 
-    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
-
     let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
     if tray_notify.is_some() {
         diagnose::log("TrayNotifyWnd found");
@@ -909,10 +915,10 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         diagnose::log("TrayNotifyWnd not found");
     }
 
-    let hook = tray_notify.and_then(|tray_hwnd| {
-        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
-    });
+    // Secondary taskbars may expose only a nested clock. Watch the selected
+    // taskbar's thread and filter its descendants in the callback.
+    let thread_id = native_interop::get_window_thread_id(taskbar.hwnd);
+    let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
     if hook.is_some() {
         diagnose::log("tray event hook installed");
     } else {
@@ -979,20 +985,88 @@ fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)>
         })
 }
 
-fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
-    let mut tray_left = taskbar_rect.right;
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-    tray_left
+#[derive(Clone, Copy, Debug)]
+struct TaskbarPlacement {
+    /// Desktop coordinates; convert to the actual parent client coordinates
+    /// only at the final MoveWindow call.
+    rect: RECT,
+    offset: i32,
 }
 
-fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
-    offset.clamp(0, max_offset)
+fn compute_taskbar_placement(
+    taskbar: RECT,
+    notification: Option<RECT>,
+    requested_size: SIZE,
+    offset: i32,
+    anchor_left: bool,
+    unknown_reserve: i32,
+) -> Option<TaskbarPlacement> {
+    let taskbar_width = taskbar.right - taskbar.left;
+    let taskbar_height = taskbar.bottom - taskbar.top;
+    if taskbar_width <= 0 || taskbar_height <= 0 {
+        return None;
+    }
+    let notification = notification.filter(|rect| {
+        rect.left < rect.right
+            && rect.top < rect.bottom
+            && rect.left < taskbar.right
+            && rect.right > taskbar.left
+            && rect.top < taskbar.bottom
+            && rect.bottom > taskbar.top
+    });
+    let tray_left = notification.map_or_else(
+        || {
+            // An unfamiliar Explorer layout is not evidence that the clock
+            // takes no space. Stay at the left and reserve the right edge.
+            let reserve = unknown_reserve.max(taskbar_width / 4).min(taskbar_width);
+            taskbar.right - reserve
+        },
+        |rect| rect.left.max(taskbar.left),
+    );
+    // Clip a large/multi-provider widget to the available span. Clamping just
+    // its left edge would still let its right edge cover the clock.
+    let width = requested_size.cx.min(tray_left - taskbar.left);
+    let height = requested_size.cy.min(taskbar_height);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let offset = offset.clamp(0, tray_left - taskbar.left - width);
+    let x = compute_anchor_x(
+        taskbar.left,
+        tray_left,
+        width,
+        offset,
+        anchor_left || notification.is_none(),
+    );
+    let y = compute_anchor_y(taskbar.top, taskbar_height, height);
+    Some(TaskbarPlacement {
+        rect: RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
+        },
+        offset,
+    })
+}
+
+fn placement_for_taskbar(
+    taskbar_hwnd: HWND,
+    taskbar_rect: RECT,
+    offset: i32,
+    anchor_left: bool,
+) -> Option<TaskbarPlacement> {
+    compute_taskbar_placement(
+        taskbar_rect,
+        native_interop::taskbar_notification_rect(taskbar_hwnd),
+        SIZE {
+            cx: total_widget_width(),
+            cy: sc(WIDGET_HEIGHT),
+        },
+        offset,
+        anchor_left,
+        sc(160),
+    )
 }
 
 fn offset_for_drop_point(
@@ -1001,10 +1075,12 @@ fn offset_for_drop_point(
     pt: POINT,
     drag_start_client_x: i32,
 ) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
-    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
-    clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
+    let Some(placement) = placement_for_taskbar(taskbar_hwnd, taskbar_rect, 0, false) else {
+        return 0;
+    };
+    let desired_left = pt.x - drag_start_client_x;
+    // Positioning applies the same final clamp as live dragging.
+    (placement.rect.left - desired_left).max(0)
 }
 
 fn now_unix_secs() -> u64 {
@@ -1192,6 +1268,25 @@ fn show_error_message(hwnd: HWND, title: &str, message: &str) {
             MB_OK | MB_ICONERROR,
         );
     }
+}
+
+fn show_display_selection_error(hwnd: HWND) {
+    // A failed native attachment leaves the previous selection in app state.
+    // Repaint that display before opening the message box.
+    position_at_taskbar();
+    render_layered();
+    let title = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.language.strings().window_title)
+            .unwrap_or("Codex Usage")
+    };
+    show_error_message(
+        hwnd,
+        title,
+        "Windows could not move the widget to that display. Your previous display selection has been kept. Please try another display.",
+    );
 }
 
 fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor) -> bool {
@@ -1783,18 +1878,6 @@ fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: 
         + sc(RIGHT_MARGIN)
 }
 
-fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(
-        active_model_count(
-            state.show_claude_code,
-            state.show_codex,
-            state.show_antigravity,
-        ),
-        state.language,
-        state.appearance,
-    )
-}
-
 fn total_widget_width() -> i32 {
     let (active_models, language, appearance) = {
         let state = lock_state();
@@ -2317,7 +2400,7 @@ fn render_layered() {
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
-        let screen_dc = GetDC(hwnd);
+        let screen_dc = GetDC(HWND::default());
 
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -2339,7 +2422,7 @@ fn render_layered() {
 
         if dib.is_invalid() || bits.is_null() {
             let _ = DeleteDC(mem_dc);
-            ReleaseDC(hwnd, screen_dc);
+            ReleaseDC(HWND::default(), screen_dc);
             return;
         }
 
@@ -2413,9 +2496,11 @@ fn render_layered() {
             AlphaFormat: 1, // AC_SRC_ALPHA
         };
 
-        let _ = UpdateLayeredWindow(
+        if let Err(error) = UpdateLayeredWindow(
             hwnd,
             screen_dc,
+            // MoveWindow already set the child position in parent coordinates.
+            // A null destination keeps it there, including on other displays.
             None,
             Some(&sz),
             mem_dc,
@@ -2423,13 +2508,15 @@ fn render_layered() {
             COLORREF(0),
             Some(&blend),
             ULW_ALPHA,
-        );
+        ) {
+            diagnose::log(format!("layered widget render failed: {error}"));
+        }
 
         // Cleanup
         SelectObject(mem_dc, old_bmp);
         let _ = DeleteObject(dib);
         let _ = DeleteDC(mem_dc);
-        ReleaseDC(hwnd, screen_dc);
+        ReleaseDC(HWND::default(), screen_dc);
     }
 }
 
@@ -2934,6 +3021,31 @@ fn tray_reposition_is_suppressed() -> bool {
     }
 }
 
+fn move_widget_to_screen_rect(hwnd: HWND, embedded: bool, rect: RECT) -> windows::core::Result<()> {
+    let screen_point = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let point = if embedded {
+        let parent = unsafe { GetParent(hwnd)? };
+        native_interop::screen_to_client_point(parent, screen_point).ok_or_else(|| {
+            windows::core::Error::new(E_FAIL, "Could not map widget position to its parent")
+        })?
+    } else {
+        screen_point
+    };
+    unsafe {
+        MoveWindow(
+            hwnd,
+            point.x,
+            point.y,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            true,
+        )
+    }
+}
+
 fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
@@ -2975,25 +3087,34 @@ fn position_at_taskbar() {
         }
     };
 
-    let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-    let mut tray_left = taskbar_rect.right;
-    let anchor_top = taskbar_rect.top;
-    let anchor_height = taskbar_height;
-
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
+    let Some(placement) =
+        placement_for_taskbar(taskbar_hwnd, taskbar_rect, tray_offset, anchor_left)
+    else {
+        // No pixels are available before the clock. A zero-sized window keeps
+        // the visibility preference and tray menu without covering the clock.
+        let empty = RECT {
+            left: taskbar_rect.left,
+            right: taskbar_rect.left,
+            top: taskbar_rect.top,
+            bottom: taskbar_rect.top,
+        };
+        if let Err(error) = move_widget_to_screen_rect(hwnd, embedded, empty) {
+            diagnose::log(format!("widget placement failed: {error}"));
         }
+        diagnose::log("widget has no available space before the taskbar notification area");
+        return;
+    };
+
+    if let Err(error) = move_widget_to_screen_rect(hwnd, embedded, placement.rect) {
+        diagnose::log(format!("widget placement failed: {error}"));
+        return;
     }
 
-    let widget_width = total_widget_width();
-    let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-    let tray_offset = tray_offset.clamp(0, max_offset);
     let offset_changed = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            if !anchor_left && s.tray_offset != tray_offset {
-                s.tray_offset = tray_offset;
+            if !anchor_left && s.tray_offset != placement.offset {
+                s.tray_offset = placement.offset;
                 true
             } else {
                 false
@@ -3006,36 +3127,10 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
-    let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-    if embedded {
-        // Child window: coordinates relative to parent (taskbar)
-        let x = compute_anchor_x(
-            taskbar_rect.left,
-            tray_left,
-            widget_width,
-            tray_offset,
-            anchor_left,
-        ) - taskbar_rect.left;
-        native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
-            y - taskbar_rect.top
-        ));
-    } else {
-        // Topmost popup: screen coordinates
-        let x = compute_anchor_x(
-            taskbar_rect.left,
-            tray_left,
-            widget_width,
-            tray_offset,
-            anchor_left,
-        );
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
-        ));
-    }
+    diagnose::log(format!(
+        "positioned widget embedded={embedded} screen=({}, {}, {}, {})",
+        placement.rect.left, placement.rect.top, placement.rect.right, placement.rect.bottom
+    ));
 }
 
 fn compute_anchor_x(
@@ -3069,14 +3164,19 @@ unsafe extern "system" fn on_tray_location_changed(
 ) {
     static LAST_REPOSITION: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-    let is_tray = {
+    let watched_windows = {
         let state = lock_state();
-        state
-            .as_ref()
-            .and_then(|s| s.tray_notify_hwnd)
-            .map(|h| h == hwnd)
-            .unwrap_or(false)
+        state.as_ref().and_then(|s| {
+            s.taskbar_hwnd
+                .map(|taskbar| (taskbar, s.tray_notify_hwnd, s.hwnd.to_hwnd()))
+        })
     };
+    let is_tray = watched_windows.is_some_and(|(taskbar, tray, widget)| {
+        // Exclude our own MoveWindow/render notifications to avoid a loop.
+        hwnd != widget
+            && !IsChild(widget, hwnd).as_bool()
+            && (Some(hwnd) == tray || hwnd == taskbar || IsChild(taskbar, hwnd).as_bool())
+    });
 
     if is_tray {
         if tray_reposition_is_suppressed() {
@@ -3164,7 +3264,7 @@ unsafe extern "system" fn wnd_proc(
             recover_polling(hwnd, true);
             LRESULT(0)
         }
-        WM_DISPLAYCHANGE | WM_DPICHANGED_MSG | WM_SETTINGCHANGE => {
+        WM_DISPLAYCHANGE | WM_DPICHANGED_MSG | WM_DPICHANGED_AFTERPARENT | WM_SETTINGCHANGE => {
             if msg == WM_DPICHANGED_MSG {
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
                 CURRENT_DPI.store(new_dpi, Ordering::Relaxed);
@@ -3273,100 +3373,51 @@ unsafe extern "system" fn wnd_proc(
                 s.drag_start_client_x = client_x;
                 s.drag_start_offset = s.tray_offset;
             }
+            drop(state);
             SetCapture(hwnd);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let is_dragging = {
+            let drag = {
                 let state = lock_state();
-                state.as_ref().map(|s| s.dragging).unwrap_or(false)
+                state.as_ref().filter(|s| s.dragging).and_then(|s| {
+                    s.taskbar_hwnd.map(|taskbar| {
+                        (
+                            taskbar,
+                            s.embedded,
+                            s.drag_start_mouse_x,
+                            s.drag_start_offset,
+                        )
+                    })
+                })
             };
-            if is_dragging {
+            if let Some((taskbar, embedded, start_x, start_offset)) = drag {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
-                let move_target = {
-                    let mut state = lock_state();
-                    let s = match state.as_mut() {
-                        Some(s) => s,
-                        None => return LRESULT(0),
-                    };
-
-                    // Moving mouse left = positive delta = larger offset (further left)
-                    let delta = s.drag_start_mouse_x - pt.x;
-                    let mut new_offset = s.drag_start_offset + delta;
-
-                    // Clamp: offset >= 0 (can't go right of default)
-                    if new_offset < 0 {
-                        new_offset = 0;
-                    }
-
-                    let taskbar_hwnd = s.taskbar_hwnd;
-                    let embedded = s.embedded;
-                    let hwnd_val = s.hwnd.to_hwnd();
-
-                    // Clamp: don't go past left edge of taskbar
-                    if let Some(taskbar_hwnd) = taskbar_hwnd {
-                        if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                            let mut tray_left = taskbar_rect.right;
-                            if let Some(tray_hwnd) =
-                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                            {
-                                if let Some(tray_rect) =
-                                    native_interop::get_window_rect_safe(tray_hwnd)
-                                {
-                                    tray_left = tray_rect.left;
+                // Moving left increases the right-relative offset. Use exactly
+                // the same clock boundary and clipped size as normal placement.
+                let offset = start_offset.saturating_add(start_x.saturating_sub(pt.x));
+                if let Some(rect) = native_interop::get_taskbar_rect(taskbar) {
+                    if let Some(placement) = placement_for_taskbar(taskbar, rect, offset, false) {
+                        match move_widget_to_screen_rect(hwnd, embedded, placement.rect) {
+                            Ok(()) => {
+                                let mut state = lock_state();
+                                if let Some(s) = state.as_mut() {
+                                    s.tray_offset = placement.offset;
                                 }
                             }
-                            let widget_width = total_widget_width_for_state(s);
-                            let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-                            if new_offset > max_offset {
-                                new_offset = max_offset;
-                            }
-
-                            s.tray_offset = new_offset;
-
-                            let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-                            let anchor_top = taskbar_rect.top;
-                            let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
-                            let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-                            let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - new_offset
-                            } else {
-                                tray_left - widget_width - new_offset
-                            };
-                            Some((
-                                hwnd_val,
-                                embedded,
-                                x,
-                                y,
-                                taskbar_rect.top,
-                                widget_width,
-                                widget_height,
-                            ))
-                        } else {
-                            s.tray_offset = new_offset;
-                            None
+                            Err(error) => diagnose::log(format!("widget drag failed: {error}")),
                         }
                     } else {
-                        s.tray_offset = new_offset;
-                        None
-                    }
-                };
-
-                if let Some((hwnd_val, embedded, x, y, taskbar_top, widget_width, widget_height)) =
-                    move_target
-                {
-                    if embedded {
-                        native_interop::move_window(
-                            hwnd_val,
-                            x,
-                            y - taskbar_top,
-                            widget_width,
-                            widget_height,
-                        );
-                    } else {
-                        native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
+                        let empty = RECT {
+                            left: rect.left,
+                            right: rect.left,
+                            top: rect.top,
+                            bottom: rect.top,
+                        };
+                        if let Err(error) = move_widget_to_screen_rect(hwnd, embedded, empty) {
+                            diagnose::log(format!("widget drag failed: {error}"));
+                        }
                     }
                 }
             }
@@ -3392,31 +3443,34 @@ unsafe extern "system" fn wnd_proc(
                 let _ = ReleaseCapture();
                 if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
                     if target_index != current_taskbar_index {
-                        let new_offset = offset_for_drop_point(
-                            target_taskbar.hwnd,
-                            target_taskbar.rect,
-                            pt,
-                            drag_start_client_x,
-                        );
-                        {
+                        let previous_dpi = CURRENT_DPI.load(Ordering::Relaxed).max(1);
+                        if attach_to_taskbar(hwnd, target_index) {
+                            refresh_dpi();
+                            let new_dpi = CURRENT_DPI.load(Ordering::Relaxed);
+                            let grab_x = (drag_start_client_x as i64 * new_dpi as i64
+                                / previous_dpi as i64)
+                                as i32;
+                            let new_offset = offset_for_drop_point(
+                                target_taskbar.hwnd,
+                                target_taskbar.rect,
+                                pt,
+                                grab_x,
+                            );
+                            let monitor_device =
+                                native_interop::taskbar_monitor_device(&target_taskbar);
                             let mut state = lock_state();
                             if let Some(s) = state.as_mut() {
+                                s.monitor_device = monitor_device;
                                 s.tray_offset = new_offset;
                             }
-                        }
-                        if attach_to_taskbar(hwnd, target_index) {
-                            let mut state = lock_state();
-                            if let Some(s) = state.as_mut() {
-                                s.monitor_device =
-                                    native_interop::taskbar_monitor_device(&target_taskbar);
-                            }
-                            drop(state);
-                            position_at_taskbar();
-                            render_layered();
+                        } else {
+                            show_display_selection_error(hwnd);
                         }
                     }
                 }
                 save_state_settings();
+                position_at_taskbar();
+                render_layered();
             }
             LRESULT(0)
         }
@@ -3524,7 +3578,11 @@ unsafe extern "system" fn wnd_proc(
                             save_state_settings();
                             position_at_taskbar();
                             render_layered();
+                        } else {
+                            show_display_selection_error(hwnd);
                         }
+                    } else {
+                        show_display_selection_error(hwnd);
                     }
                 }
                 IDM_START_WITH_WINDOWS => {
@@ -5081,6 +5139,222 @@ mod tests {
         }
         assert_eq!(compute_anchor_x(0, 300, 606, 321, true), 0);
         assert_eq!(compute_anchor_x(0, 2000, 606, 321, false), 1073);
+    }
+
+    #[test]
+    fn taskbar_placement_reserves_clock_at_primary_and_negative_origins() {
+        for (left, top) in [(0, 1032), (-2560, -48), (1920, 1392)] {
+            let taskbar = RECT {
+                left,
+                top,
+                right: left + 1920,
+                bottom: top + 48,
+            };
+            let clock = RECT {
+                left: left + 1740,
+                ..taskbar
+            };
+            let placement = compute_taskbar_placement(
+                taskbar,
+                Some(clock),
+                SIZE { cx: 606, cy: 46 },
+                0,
+                false,
+                160,
+            )
+            .unwrap();
+            assert_eq!(
+                placement.rect,
+                RECT {
+                    left: left + 1134,
+                    top: top + 2,
+                    right: clock.left,
+                    bottom: taskbar.bottom,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn taskbar_placement_clips_oversized_widget_instead_of_covering_clock() {
+        let taskbar = RECT {
+            left: -800,
+            top: 900,
+            right: 0,
+            bottom: 996,
+        };
+        let clock = RECT {
+            left: -220,
+            ..taskbar
+        };
+        for anchor_left in [false, true] {
+            let placement = compute_taskbar_placement(
+                taskbar,
+                Some(clock),
+                // Three providers at a large display scale on a narrow bar.
+                SIZE { cx: 2200, cy: 92 },
+                321,
+                anchor_left,
+                320,
+            )
+            .unwrap();
+            assert_eq!(placement.rect.left, -800);
+            assert_eq!(placement.rect.right, -220);
+            assert_eq!(placement.rect.top, 904);
+            assert_eq!(placement.rect.bottom, 996);
+            assert_eq!(placement.offset, 0);
+        }
+        assert!(compute_taskbar_placement(
+            taskbar,
+            Some(taskbar),
+            SIZE { cx: 2200, cy: 92 },
+            0,
+            false,
+            320,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn taskbar_placement_clamps_drag_offsets_to_the_same_clock_boundary() {
+        let taskbar = RECT {
+            left: -1920,
+            top: 1040,
+            right: 0,
+            bottom: 1080,
+        };
+        let clock = RECT {
+            left: -200,
+            ..taskbar
+        };
+        for (offset, expected_left, expected_offset) in [
+            (-500, -800, 0),
+            (0, -800, 0),
+            (321, -1121, 321),
+            (i32::MAX, -1920, 1120),
+        ] {
+            let placement = compute_taskbar_placement(
+                taskbar,
+                Some(clock),
+                SIZE { cx: 600, cy: 46 },
+                offset,
+                false,
+                160,
+            )
+            .unwrap();
+            assert_eq!(placement.rect.left, expected_left);
+            assert_eq!(placement.offset, expected_offset);
+            assert!(placement.rect.right <= clock.left);
+            assert_eq!(placement.rect.top, taskbar.top);
+        }
+    }
+
+    #[test]
+    fn unrecognized_taskbar_layout_stays_left_and_reserves_the_right_edge() {
+        let taskbar = RECT {
+            left: -1200,
+            top: 0,
+            right: 0,
+            bottom: 48,
+        };
+        for requested_width in [400, 2000] {
+            for notification in [
+                None,
+                // A stale rectangle from a different display is not a clock
+                // bound for the selected taskbar.
+                Some(RECT {
+                    left: 1600,
+                    right: 1920,
+                    ..taskbar
+                }),
+            ] {
+                let placement = compute_taskbar_placement(
+                    taskbar,
+                    notification,
+                    SIZE {
+                        cx: requested_width,
+                        cy: 46,
+                    },
+                    0,
+                    false,
+                    160,
+                )
+                .unwrap();
+                assert_eq!(placement.rect.left, taskbar.left);
+                assert!(placement.rect.right <= -300);
+            }
+        }
+    }
+
+    #[test]
+    fn widget_move_maps_screen_rect_through_actual_parent_client_origin() {
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+
+        unsafe {
+            for (left, top) in [(0, 100), (-1600, -400), (1600, 500)] {
+                // The border makes the client origin differ from the outer
+                // taskbar RECT, exposing the old subtract-the-RECT behavior.
+                let parent = TestWindow(
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        windows::core::w!("STATIC"),
+                        windows::core::w!("widget-coordinate-test"),
+                        WS_POPUP | WS_BORDER,
+                        left,
+                        top,
+                        1000,
+                        120,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                );
+                let widget = TestWindow(
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        windows::core::w!("STATIC"),
+                        windows::core::w!("widget-coordinate-child"),
+                        WS_CHILD,
+                        0,
+                        0,
+                        20,
+                        20,
+                        parent.0,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                );
+                let expected = RECT {
+                    left: left + 80,
+                    top: top + 30,
+                    right: left + 680,
+                    bottom: top + 76,
+                };
+                move_widget_to_screen_rect(widget.0, true, expected).unwrap();
+                assert_eq!(
+                    native_interop::get_window_rect_safe(widget.0),
+                    Some(expected)
+                );
+                // Popup fallback uses the same screen rectangle without
+                // applying a taskbar/client-origin adjustment.
+                move_widget_to_screen_rect(parent.0, false, expected).unwrap();
+                assert_eq!(
+                    native_interop::get_window_rect_safe(parent.0),
+                    Some(expected)
+                );
+            }
+        }
     }
 
     #[test]
