@@ -41,9 +41,9 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 
 ## Who This Is For
 
-This app is for Windows users who already have **Codex CLI or the Codex app installed and signed in**.
+This app is for Windows users with a **Codex ChatGPT sign-in stored in a supported local credential file**. See [Account Support](#account-support) before installing.
 
-Codex is enabled by default. The app reads the same local credentials used by Codex.
+Codex is enabled by default. The monitor reuses the supported credential file; it does not provide its own sign-in flow.
 
 Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** service from the right-click **Monitored services** menu.
 
@@ -52,7 +52,7 @@ It works best if you want a simple "how close am I to the limit?" display that i
 ## Requirements
 
 - Windows 10 or Windows 11
-- Codex CLI or Codex app installed and authenticated
+- A Codex CLI or app ChatGPT session using the [supported file-based authentication](#account-support)
 - Optional: Claude Code installed and authenticated
 - Optional: Google Antigravity installed and authenticated, if you want Antigravity usage
 
@@ -184,7 +184,7 @@ This writes a log file to:
 %TEMP%\codex-usage.log
 ```
 
-The log records the application version, install channel, executable path, polling failure category, and retry timing. It does not log access tokens or credential contents. See [Troubleshooting](docs/troubleshooting.md) for the taskbar error labels and recovery steps.
+The log records the application version, install channel, executable path, polling failure category, and retry timing. It can also include local paths, launch arguments, and WSL distribution names; review it before sharing. See [Troubleshooting](docs/troubleshooting.md) for the taskbar error labels and recovery steps.
 
 Settings are saved to:
 
@@ -194,7 +194,13 @@ Settings are saved to:
 
 ## Account Support
 
-Codex usage is read from the account authenticated in the local Codex installation. Optional Claude Code monitoring works with the account types supported by Claude Code.
+Codex monitoring currently supports **file-based ChatGPT authentication**. It reads the Windows user's `.codex\auth.json`, or `auth.json` under the `CODEX_HOME` inherited by the monitor process. The file must contain `tokens.access_token`; the monitor sends `tokens.account_id` when present. A `CODEX_HOME` set only in a terminal may not reach a monitor launched from the Start menu or at sign-in.
+
+Codex keyring-only and ephemeral sessions, API-key authentication, and browser-only sign-ins are unsupported. Codex credentials in WSL are not discovered automatically. The monitor queries the fixed `https://chatgpt.com/backend-api/wham/usage` endpoint and does not read Codex's custom gateway/backend configuration. Company or SSO sessions can work when they provide the supported file and the workspace permits this endpoint; being signed in to Codex alone does not establish compatibility.
+
+In passive mode, renewal is handled by the **official Codex app or CLI**. After it refreshes the stored session, or you sign in there again, choose **Refresh** in the monitor. Monitoring alone does not keep a login alive. Keep your organization's credential-storage and gateway requirements; do not export tokens or weaken those requirements to accommodate this version.
+
+Optional Claude Code monitoring works with the account types supported by Claude Code.
 
 As of **March 19, 2026**, Anthropic's Claude Code setup documentation says:
 
@@ -210,7 +216,7 @@ This project is **open source**, so you can inspect exactly what it does.
 What the app reads, only for services you have enabled:
 
 - If Claude Code is enabled, its local OAuth credentials from `~/.claude/.credentials.json`, the directory set in `CLAUDE_CONFIG_DIR`, or a supported WSL environment
-- If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
+- If Codex is enabled, the supported Windows Codex credential file described in [Account Support](#account-support); the whole file is read into memory, while only its access token and optional account ID are used
 - If Antigravity is enabled, your local Antigravity OAuth token from Windows Credential Manager target `gemini:antigravity`
 
 What the app sends over the network:

@@ -6,13 +6,19 @@ Codex Usage keeps authentication failures separate from transient service failur
 
 | Simplified Chinese | Other languages | Meaning | Recommended action |
 |---|---|---|---|
-| `!` | `!` | Enabled service credentials are missing or expired | Sign in with the relevant CLI/app, then refresh Codex Usage. Claude Desktop login does not count as Claude Code CLI login. |
+| `!` | `!` | Enabled service credentials are missing, expired, or rejected | Check the supported credential source, sign in with the relevant CLI/app, then refresh Codex Usage. Claude Desktop login does not count as Claude Code CLI login. |
 | `网络` | `NET` | Network or TLS connection failed | Check connectivity, VPN, proxy, and firewall settings |
 | `限流` | `429` | Provider rate limit | Wait for the provider retry window; Codex Usage retries with backoff |
 | `服务` | `5XX` | Provider service failure | Wait and retry; check provider status if it persists |
 | `错误` | `ERR` | Invalid or unsupported response | Enable diagnostics and inspect the log |
 
 Authentication failures pause provider polling until the credential source changes, preventing repeated login notifications. Transient failures use exponential backoff up to the configured refresh interval.
+
+## Codex is signed in, but the monitor shows `!`
+
+A successful Codex sign-in does not guarantee a compatible credential file. Check [Account Support](../README.md#account-support), especially file storage versus keyring or ephemeral storage, the Windows user and inherited `CODEX_HOME`, WSL-only installations, and company gateway requirements. The monitor does not use API keys or browser cookies. Preserve your organization's authentication controls.
+
+In passive mode, let the official Codex app or CLI renew the session, or sign in there again, then choose **Refresh**. The monitor rereads the supported credential file; it does not renew the session itself. A `401` or `403` can also indicate workspace or endpoint restrictions that another sign-in will not resolve.
 
 ## Diagnostic log
 
@@ -29,7 +35,7 @@ The log is written to `%TEMP%\codex-usage.log`. It includes:
 - provider failure category and retry delay
 - window creation, taskbar placement, and relaunch events
 
-The log does not include access tokens, refresh tokens, credential file contents, or API response bodies.
+The log may also include local paths, launch arguments, and WSL distribution names. Review it for account or machine identifiers before sharing, and do not attach credential files or tokens to a report.
 
 ## Update failures
 

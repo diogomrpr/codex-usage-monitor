@@ -41,9 +41,9 @@
 
 ## 适用人群
 
-本应用适合已经在 Windows 上**安装并登录 Codex CLI 或 Codex 应用**的用户。
+本应用适合在 Windows 上使用 **Codex ChatGPT 登录，且登录信息保存在受支持的本地凭据文件中**的用户。安装前请查看[账户支持](#账户支持)。
 
-Codex 默认启用，应用会读取 Codex 使用的同一份本地登录凭据。
+Codex 默认启用。监控器复用受支持的凭据文件，不提供独立的登录流程。
 
 Antigravity 也是可选功能。若要显示其用量，请安装并登录 Google Antigravity，然后在右键菜单的**监控服务**中启用 **Antigravity**。
 
@@ -52,7 +52,7 @@ Antigravity 也是可选功能。若要显示其用量，请安装并登录 Goog
 ## 系统要求
 
 - Windows 10 或 Windows 11
-- 已安装并完成身份验证的 Codex CLI 或 Codex 应用
+- 使用[受支持的文件身份验证](#账户支持)的 Codex CLI 或应用 ChatGPT 登录
 - 可选：已安装并完成身份验证的 Claude Code
 - 可选：若需查看 Antigravity 用量，需安装并登录 Google Antigravity
 
@@ -191,7 +191,7 @@ codex-usage --diagnose
 %TEMP%\codex-usage.log
 ```
 
-日志会记录应用版本、安装渠道、可执行文件路径、轮询失败类别和重试时间，但不会记录访问令牌或凭据内容。有关任务栏错误标签及恢复步骤，请参阅[故障排除](docs/troubleshooting.md)。
+日志会记录应用版本、安装渠道、可执行文件路径、轮询失败类别和重试时间，也可能包含本地路径、启动参数和 WSL 发行版名称；分享前请先检查。有关任务栏错误标签及恢复步骤，请参阅[故障排除](docs/troubleshooting.md)。
 
 设置保存在：
 
@@ -201,7 +201,13 @@ codex-usage --diagnose
 
 ## 账户支持
 
-Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Code 监控功能支持 Claude Code 本身所支持的账户类型。
+Codex 监控目前支持**基于文件的 ChatGPT 身份验证**。监控器读取 Windows 用户的 `.codex\auth.json`，或其进程继承的 `CODEX_HOME` 目录中的 `auth.json`。文件必须包含 `tokens.access_token`；存在 `tokens.account_id` 时也会发送该账户 ID。仅在终端中设置的 `CODEX_HOME` 不一定会传递给从开始菜单或登录时启动的监控器。
+
+不支持仅存储在系统密钥环中的 Codex 会话、临时内存会话、API 密钥身份验证或仅在浏览器中登录。不会自动发现 WSL 中的 Codex 凭据。监控器访问固定的 `https://chatgpt.com/backend-api/wham/usage` 端点，不读取 Codex 的自定义网关或后端配置。公司或 SSO 会话只有在提供受支持的文件且工作区允许访问此端点时才能使用；仅登录 Codex 不代表一定兼容。
+
+被动模式下，令牌续期由 **Codex 官方应用或 CLI** 处理。待其更新已保存的会话，或在其中重新登录后，请在监控器中选择**刷新**。监控本身不会保持登录有效。请遵守组织的凭据存储和网关要求，不要为了适配此版本而导出令牌或降低这些要求。
+
+可选的 Claude Code 监控功能支持 Claude Code 本身所支持的账户类型。
 
 截至 **2026 年 3 月 19 日**，Anthropic 的 Claude Code 设置文档说明：
 
@@ -217,7 +223,7 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 应用读取的内容（仅限已启用的服务）：
 
 - 启用 Claude Code 时，读取 `~/.claude/.credentials.json`、`CLAUDE_CONFIG_DIR` 指定目录或受支持 WSL 环境中的本地 OAuth 凭据
-- 启用 Codex 时，读取 `$CODEX_HOME/auth.json` 或 `~/.codex/auth.json` 中的本地 Codex 凭据
+- 启用 Codex 时，读取[账户支持](#账户支持)中说明的 Windows Codex 凭据文件；整个文件会被读入内存，但仅使用访问令牌和可选的账户 ID
 - 启用 Antigravity 时，读取 Windows 凭据管理器中目标为 `gemini:antigravity` 的本地 OAuth 令牌
 
 应用通过网络发送的请求：

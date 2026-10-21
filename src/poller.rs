@@ -581,10 +581,28 @@ fn resolve_windows_codex_path() -> String {
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
-    Ok(ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
+    Ok(usage_agent_builder()
         .tls_connector(std::sync::Arc::new(tls))
         .build())
+}
+
+fn usage_agent_builder() -> ureq::AgentBuilder {
+    // Provider credentials and account metadata belong only to the requested
+    // HTTPS endpoint. Never forward any part of an authenticated request.
+    ureq::AgentBuilder::new()
+        .https_only(true)
+        .redirects(0)
+        .timeout(Duration::from_secs(30))
+}
+
+fn reject_usage_redirect(response: ureq::Response) -> Result<ureq::Response, ureq::Error> {
+    // With redirects disabled, ureq returns 3xx as a successful response.
+    // Reject it before any provider can interpret its body or quota headers.
+    if (300..400).contains(&response.status()) {
+        Err(ureq::Error::Status(response.status(), response))
+    } else {
+        Ok(response)
+    }
 }
 
 fn classify_http_status(status: u16) -> PollError {
@@ -606,6 +624,27 @@ fn classify_ureq_error(error: &ureq::Error) -> PollError {
         ureq::Error::Status(status, _) => classify_http_status(*status),
         ureq::Error::Transport(_) => PollError::NetworkUnavailable,
     }
+}
+
+fn usage_request_error_message(error: &ureq::Error) -> String {
+    let category = classify_ureq_error(error).category();
+    // ureq's raw transport error can contain the entire invalid Authorization
+    // header. URLs, response text and header values must never enter this log.
+    match error {
+        ureq::Error::Status(status, _) => format!("category={category} status={status}"),
+        ureq::Error::Transport(transport) => {
+            format!("category={category} kind={:?}", transport.kind())
+        }
+    }
+}
+
+fn log_usage_request_error(context: &'static str, error: &ureq::Error) {
+    diagnose::log(format!("{context}: {}", usage_request_error_message(error)));
+}
+
+fn log_usage_parse_error(context: &'static str, error: std::io::Error) {
+    // A JSON error can quote a response value. Keep only its non-sensitive kind.
+    diagnose::log(format!("{context}: kind={:?}", error.kind()));
 }
 
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
@@ -772,6 +811,7 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         .set("Authorization", &format!("Bearer {token}"))
         .set("anthropic-beta", "oauth-2025-04-20")
         .call()
+        .and_then(reject_usage_redirect)
     {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
@@ -832,8 +872,15 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
             .set("anthropic-version", "2023-06-01")
             .set("anthropic-beta", "oauth-2025-04-20")
             .send_json(&body)
+            .and_then(reject_usage_redirect)
         {
             Ok(resp) => resp,
+            Err(ureq::Error::Status(code, _)) if (300..400).contains(&code) => {
+                // Unlike API failures below, a redirect must never contribute
+                // quota headers to an otherwise successful result.
+                diagnose::log(format!("messages endpoint rejected redirect status {code}"));
+                return Err(PollError::RequestFailed);
+            }
             Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
                 diagnose::log(format!(
                     "messages endpoint returned auth error status {code}; re-login required"
@@ -921,11 +968,11 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         request = request.set("ChatGPT-Account-Id", account_id);
     }
 
-    let resp = match request.call() {
+    let resp = match request.call().and_then(reject_usage_redirect) {
         Ok(resp) => resp,
         Err(error) => {
             let classified = classify_ureq_error(&error);
-            diagnose::log_error("Codex usage endpoint request failed", error);
+            log_usage_request_error("Codex usage endpoint request failed", &error);
             return Err(classified);
         }
     };
@@ -933,7 +980,7 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
     let response: CodexUsageResponse = match resp.into_json() {
         Ok(response) => response,
         Err(error) => {
-            diagnose::log_error("unable to parse Codex usage response", error);
+            log_usage_parse_error("unable to parse Codex usage response", error);
             return Err(PollError::RequestFailed);
         }
     };
@@ -1071,11 +1118,12 @@ fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<Strin
         .set("Content-Type", "application/json")
         .set("User-Agent", "antigravity")
         .send_json(&body)
+        .and_then(reject_usage_redirect)
     {
         Ok(resp) => resp,
         Err(error) => {
             let classified = classify_ureq_error(&error);
-            diagnose::log_error("Antigravity loadCodeAssist request failed", error);
+            log_usage_request_error("Antigravity loadCodeAssist request failed", &error);
             return Err(classified);
         }
     };
@@ -1083,7 +1131,7 @@ fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<Strin
     let response: AntigravityLoadResponse = match resp.into_json() {
         Ok(response) => response,
         Err(error) => {
-            diagnose::log_error("unable to parse Antigravity loadCodeAssist response", error);
+            log_usage_parse_error("unable to parse Antigravity loadCodeAssist response", error);
             return Err(PollError::RequestFailed);
         }
     };
@@ -1108,11 +1156,12 @@ fn fetch_antigravity_model_quota(
         .set("Content-Type", "application/json")
         .set("User-Agent", "antigravity")
         .send_json(&body)
+        .and_then(reject_usage_redirect)
     {
         Ok(resp) => resp,
         Err(error) => {
             let classified = classify_ureq_error(&error);
-            diagnose::log_error("Antigravity fetchAvailableModels request failed", error);
+            log_usage_request_error("Antigravity fetchAvailableModels request failed", &error);
             return Err(classified);
         }
     };
@@ -1120,7 +1169,7 @@ fn fetch_antigravity_model_quota(
     let response: AntigravityModelsResponse = match resp.into_json() {
         Ok(response) => response,
         Err(error) => {
-            diagnose::log_error(
+            log_usage_parse_error(
                 "unable to parse Antigravity fetchAvailableModels response",
                 error,
             );
@@ -1152,11 +1201,15 @@ fn fetch_antigravity_quota_summary(
         .set("Content-Type", "application/json")
         .set("User-Agent", "antigravity")
         .send_json(&body)
+        .and_then(reject_usage_redirect)
     {
         Ok(resp) => resp,
         Err(error) => {
             let classified = classify_ureq_error(&error);
-            diagnose::log_error("Antigravity retrieveUserQuotaSummary request failed", error);
+            log_usage_request_error(
+                "Antigravity retrieveUserQuotaSummary request failed",
+                &error,
+            );
             return Err(classified);
         }
     };
@@ -1164,7 +1217,7 @@ fn fetch_antigravity_quota_summary(
     let response: AntigravityQuotaSummaryResponse = match resp.into_json() {
         Ok(response) => response,
         Err(error) => {
-            diagnose::log_error(
+            log_usage_parse_error(
                 "unable to parse Antigravity retrieveUserQuotaSummary response",
                 error,
             );
@@ -1780,6 +1833,77 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    fn usage_agent_without_network() -> ureq::Agent {
+        usage_agent_builder()
+            .try_proxy_from_env(false)
+            .resolver(|_: &str| -> std::io::Result<Vec<std::net::SocketAddr>> {
+                panic!("this request must be rejected before DNS or network access")
+            })
+            .build()
+    }
+
+    #[test]
+    fn usage_transport_diagnostics_hide_malformed_credential_headers() {
+        for (header, value) in [
+            ("Authorization", "Bearer fixture-secret-token\n"),
+            ("ChatGPT-Account-Id", "fixture-secret-account\n"),
+        ] {
+            // Header validation produces a real ureq error without a connection.
+            // Its raw message may contain the entire credential header value.
+            let error = usage_agent_without_network()
+                .get("https://fixture.invalid/usage")
+                .set(header, value)
+                .call()
+                .unwrap_err();
+            assert_eq!(error.kind(), ureq::ErrorKind::BadHeader);
+            let message = usage_request_error_message(&error);
+            assert_eq!(message, "category=network_unavailable kind=BadHeader");
+            assert!(!message.contains("fixture-secret"));
+            assert!(!message.contains(header));
+        }
+    }
+
+    #[test]
+    fn usage_transport_diagnostics_keep_status_without_response_content() {
+        let response = ureq::Response::new(
+            403,
+            "fixture-secret-status",
+            r#"{"message":"fixture-secret-response"}"#,
+        )
+        .unwrap();
+        let message = usage_request_error_message(&ureq::Error::Status(403, response));
+        assert_eq!(message, "category=auth_required status=403");
+        assert!(!message.contains("fixture-secret"));
+    }
+
+    #[test]
+    fn usage_transport_rejects_http_before_dns_or_network_access() {
+        let error = usage_agent_without_network()
+            .get("http://fixture.invalid/usage")
+            .set("Authorization", "Bearer fixture-token")
+            .set("ChatGPT-Account-Id", "fixture-account")
+            .call()
+            .unwrap_err();
+        assert_eq!(error.kind(), ureq::ErrorKind::InsecureRequestHttpsOnly);
+    }
+
+    #[test]
+    fn usage_transport_rejects_redirect_responses_before_parsing_quota() {
+        for status in [300, 301, 302, 303, 304, 307, 308] {
+            let response: ureq::Response = format!(
+                "HTTP/1.1 {status} Redirect\r\nLocation: https://fixture.invalid/elsewhere\r\n\r\n{{}}"
+            )
+            .parse()
+            .unwrap();
+            assert!(matches!(
+                reject_usage_redirect(response),
+                Err(ureq::Error::Status(code, _)) if code == status
+            ));
+        }
+        let success = ureq::Response::new(200, "OK", "{}").unwrap();
+        assert_eq!(reject_usage_redirect(success).unwrap().status(), 200);
+    }
 
     fn codex_credentials(token: &str) -> CodexTokenData {
         CodexTokenData {

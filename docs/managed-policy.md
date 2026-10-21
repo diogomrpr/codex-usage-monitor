@@ -49,9 +49,11 @@ Use your organization's deployment tool to create and protect both the directory
 
 ## Authentication behavior
 
+Before deployment, check [Codex authentication compatibility](../README.md#account-support). Codex monitoring requires a supported Windows-readable `auth.json` and access to the fixed ChatGPT usage endpoint. It does not integrate with Codex keyring-only or ephemeral sessions, API-key authentication, browser-only logins, automatic WSL discovery, or custom gateways. Keep organizational storage and routing requirements in place; a managed installation does not remove these compatibility limits.
+
 With passive monitoring enabled, Codex and Claude Code authentication recovery does not run `codex exec`, `claude -p`, or another model prompt. Claude's Messages API is not called merely to collect rate-limit headers. Existing usage endpoints can still be queried with the enabled provider's existing credentials. WSL discovery, when needed for an enabled Claude Code provider, reads credentials; passive mode does not prohibit all local processes.
 
-Missing, expired, or rejected credentials produce an actionable sign-in message. The affected provider stops automatic retries until credentials change or the user explicitly selects **Refresh**. Wake and network-recovery events do not turn a blocked login into a new authentication attempt. Sign in through the provider's approved app or CLI, then refresh the monitor. Disabled providers remain untouched.
+Missing, expired, or rejected credentials produce an actionable sign-in message. The affected provider stops automatic retries until credentials change or the user explicitly selects **Refresh**. Wake and network-recovery events do not turn a blocked login into a new authentication attempt. The official Codex app or CLI handles Codex session renewal; after it updates the supported credential file or the user signs in again, select **Refresh**. Disabled providers remain untouched.
 
 If the user explicitly disables passive monitoring and machine policy permits it, legacy recovery may run `codex exec .` or `claude -p .`, or submit a Claude Messages API request. These operations can perform inference, consume quota, incur charges, and invoke CLI hooks or project configuration. They are unsuitable when the organization permits usage monitoring but has not approved those operations.
 
