@@ -208,12 +208,6 @@ pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
     }
 }
 
-/// Whether Claude Code CLI credentials are available from a supported source.
-/// Claude Desktop authentication is intentionally not treated as CLI access.
-pub fn claude_code_credentials_available() -> bool {
-    read_first_credentials().is_some()
-}
-
 fn poll_claude_code() -> Result<UsageData, PollError> {
     let creds = match read_first_credentials() {
         Some(c) => c,
@@ -229,7 +223,21 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
 }
 
 fn poll_codex() -> Result<UsageData, PollError> {
-    let creds = match read_codex_credentials() {
+    poll_codex_with(
+        read_codex_credentials,
+        fetch_codex_usage,
+        crate::privacy::passive_monitoring,
+        cli_refresh_codex_token,
+    )
+}
+
+fn poll_codex_with(
+    mut read_credentials: impl FnMut() -> Option<CodexTokenData>,
+    mut fetch_usage: impl FnMut(&str, Option<&str>) -> Result<UsageData, PollError>,
+    passive: impl Fn() -> bool,
+    refresh: impl FnOnce(),
+) -> Result<UsageData, PollError> {
+    let creds = match read_credentials() {
         Some(creds) => creds,
         None => {
             diagnose::log("Codex usage poll failed: no Codex credentials found");
@@ -237,12 +245,12 @@ fn poll_codex() -> Result<UsageData, PollError> {
         }
     };
 
-    match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
+    match fetch_usage(&creds.access_token, creds.account_id.as_deref()) {
         Ok(data) => Ok(data),
-        Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
+        Err(PollError::AuthRequired) if !passive() => {
+            refresh();
+            let refreshed = read_credentials().ok_or(PollError::TokenExpired)?;
+            fetch_usage(&refreshed.access_token, refreshed.account_id.as_deref())
         }
         Err(error) => Err(error),
     }
@@ -260,16 +268,38 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
     fetch_antigravity_usage(&creds.access_token)
 }
 
-fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
+fn refresh_or_fallback(creds: Credentials) -> Result<Credentials, PollError> {
+    refresh_or_fallback_with(
+        creds,
+        crate::privacy::passive_monitoring,
+        cli_refresh_token,
+        read_credentials_from_source,
+        read_next_credentials_after,
+    )
+}
+
+fn refresh_or_fallback_with(
+    mut creds: Credentials,
+    passive: impl Fn() -> bool,
+    refresh: impl Fn(&CredentialSource),
+    read_credentials: impl Fn(&CredentialSource) -> Option<Credentials>,
+    next_credentials: impl Fn(&CredentialSource) -> Option<Credentials>,
+) -> Result<Credentials, PollError> {
     loop {
         if !is_token_expired(creds.expires_at) {
             return Ok(creds);
         }
 
-        let source = creds.source.clone();
-        cli_refresh_token(&source);
+        // A monitoring request must not start a model task to refresh a login.
+        // Return an auth error so the scheduler waits for updated credentials.
+        if passive() {
+            return Err(PollError::TokenExpired);
+        }
 
-        match read_credentials_from_source(&source) {
+        let source = creds.source.clone();
+        refresh(&source);
+
+        match read_credentials(&source) {
             Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
             Some(_) => diagnose::log(format!(
                 "credentials from {source:?} still expired after refresh attempt"
@@ -279,7 +309,7 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
             )),
         }
 
-        match read_next_credentials_after(&source) {
+        match next_credentials(&source) {
             Some(next) => creds = next,
             None => return Err(PollError::TokenExpired),
         }
@@ -289,6 +319,9 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
 /// Invoke the Claude CLI with a minimal prompt to force its internal
 /// OAuth token refresh.
 fn cli_refresh_token(source: &CredentialSource) {
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     match source {
         CredentialSource::Windows(_) => cli_refresh_windows_token(),
         CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
@@ -296,6 +329,9 @@ fn cli_refresh_token(source: &CredentialSource) {
 }
 
 fn cli_refresh_windows_token() {
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let claude_path = resolve_windows_claude_path();
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
     diagnose::log(format!(
@@ -320,6 +356,9 @@ fn cli_refresh_windows_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -346,6 +385,9 @@ fn cli_refresh_windows_token() {
 }
 
 fn cli_refresh_wsl_token(distro: &str) {
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     diagnose::log(format!(
         "attempting WSL Claude token refresh in distro {distro}"
     ));
@@ -363,6 +405,9 @@ fn cli_refresh_wsl_token(distro: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -375,6 +420,9 @@ fn cli_refresh_wsl_token(distro: &str) {
 }
 
 fn cli_refresh_codex_token() {
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let codex_path = resolve_windows_codex_path();
     let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
     let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
@@ -407,6 +455,9 @@ fn cli_refresh_codex_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -663,12 +714,29 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
+    fetch_claude_usage_with(
+        crate::privacy::passive_monitoring,
+        || try_usage_endpoint(token),
+        || fetch_usage_via_messages(token),
+    )
+}
+
+fn fetch_claude_usage_with(
+    passive: impl Fn() -> bool,
+    usage_endpoint: impl FnOnce() -> Result<Option<UsageData>, PollError>,
+    messages_fallback: impl FnOnce() -> Result<UsageData, PollError>,
+) -> Result<UsageData, PollError> {
     // Try the dedicated usage endpoint first
-    match try_usage_endpoint(token)? {
+    match usage_endpoint()? {
         Some(data) => {
+            // Keep partial quota data as reported. Generating a message merely
+            // to fill a reset timestamp is not passive monitoring.
+            if passive() {
+                return Ok(data);
+            }
             // If reset timers are missing, fill them in from the Messages API
             if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
-                if let Ok(fallback) = fetch_usage_via_messages(token) {
+                if let Ok(fallback) = messages_fallback() {
                     let mut merged = data;
                     if merged.session.resets_at.is_none() {
                         merged.session.resets_at = fallback.session.resets_at;
@@ -684,8 +752,12 @@ fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
         None => {}
     }
 
+    if passive() {
+        return Err(PollError::RequestFailed);
+    }
+
     // Fall back to Messages API with rate limit headers
-    let result = fetch_usage_via_messages(token);
+    let result = messages_fallback();
     if result.is_err() {
         diagnose::log("usage endpoint and Messages API fallback both failed");
     }
@@ -709,6 +781,9 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
             return Err(PollError::AuthRequired);
         }
         Err(error @ ureq::Error::Status(429, _)) => return Err(classify_ureq_error(&error)),
+        Err(error) if crate::privacy::passive_monitoring() => {
+            return Err(classify_ureq_error(&error));
+        }
         Err(_) => return Ok(None),
     };
 
@@ -716,6 +791,9 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         Ok(response) => response,
         Err(_) => return Ok(None),
     };
+    if response.five_hour.is_none() && response.seven_day.is_none() {
+        return Ok(None);
+    }
     let mut data = UsageData::default();
 
     if let Some(bucket) = &response.five_hour {
@@ -732,10 +810,16 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
 }
 
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
+    if crate::privacy::passive_monitoring() {
+        return Err(PollError::RequestFailed);
+    }
     let agent = build_agent()?;
     let mut last_error = PollError::RequestFailed;
 
     for model in MODEL_FALLBACK_CHAIN {
+        if crate::privacy::passive_monitoring() {
+            return Err(PollError::RequestFailed);
+        }
         let body = serde_json::json!({
             "model": model,
             "max_tokens": 1,
@@ -1695,6 +1779,202 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    fn codex_credentials(token: &str) -> CodexTokenData {
+        CodexTokenData {
+            access_token: token.to_string(),
+            account_id: Some("fixture-account".to_string()),
+        }
+    }
+
+    fn claude_credentials(expires_at: i64) -> Credentials {
+        Credentials {
+            access_token: "fixture-token".to_string(),
+            expires_at: Some(expires_at),
+            source: CredentialSource::Windows(PathBuf::from("fixture-credentials.json")),
+        }
+    }
+
+    #[test]
+    fn passive_codex_auth_failures_do_not_launch_refresh_or_retry() {
+        for status in [401, 403] {
+            let mut credential_reads = 0;
+            let mut quota_requests = 0;
+            let result = poll_codex_with(
+                || {
+                    credential_reads += 1;
+                    Some(codex_credentials("fixture-token"))
+                },
+                |token, account| {
+                    quota_requests += 1;
+                    assert_eq!(token, "fixture-token");
+                    assert_eq!(account, Some("fixture-account"));
+                    let response: ureq::Response =
+                        format!("HTTP/1.1 {status} Unauthorized\r\n\r\n")
+                            .parse()
+                            .unwrap();
+                    Err(classify_ureq_error(&ureq::Error::Status(status, response)))
+                },
+                || true,
+                || panic!("a passive poll must not launch the Codex CLI"),
+            );
+            assert_eq!(result.unwrap_err(), PollError::AuthRequired);
+            assert_eq!(credential_reads, 1);
+            assert_eq!(quota_requests, 1);
+        }
+    }
+
+    #[test]
+    fn enabling_passive_mode_during_codex_request_prevents_auth_refresh() {
+        let passive = Cell::new(false);
+        let result = poll_codex_with(
+            || Some(codex_credentials("fixture-token")),
+            |_, _| {
+                passive.set(true);
+                Err(PollError::AuthRequired)
+            },
+            || passive.get(),
+            || panic!("the policy must be rechecked after the quota request"),
+        );
+        assert_eq!(result.unwrap_err(), PollError::AuthRequired);
+    }
+
+    #[test]
+    fn non_passive_codex_refresh_reloads_credentials_before_retrying() {
+        let mut credential_reads = 0;
+        let mut quota_requests = 0;
+        let mut refreshes = 0;
+        let result = poll_codex_with(
+            || {
+                credential_reads += 1;
+                Some(codex_credentials(if credential_reads == 1 {
+                    "expired-fixture"
+                } else {
+                    "refreshed-fixture"
+                }))
+            },
+            |token, _| {
+                quota_requests += 1;
+                if quota_requests == 1 {
+                    assert_eq!(token, "expired-fixture");
+                    Err(PollError::AuthRequired)
+                } else {
+                    assert_eq!(token, "refreshed-fixture");
+                    Ok(UsageData::default())
+                }
+            },
+            || false,
+            || refreshes += 1,
+        );
+        assert!(result.is_ok());
+        assert_eq!(credential_reads, 2);
+        assert_eq!(quota_requests, 2);
+        assert_eq!(refreshes, 1);
+    }
+
+    #[test]
+    fn passive_expired_claude_credentials_do_not_launch_cli_or_switch_source() {
+        let result = refresh_or_fallback_with(
+            claude_credentials(0),
+            || true,
+            |_| panic!("a passive poll must not launch the Claude CLI"),
+            |_| panic!("no refresh means no refreshed credential read"),
+            |_| panic!("expired credentials must wait for user sign-in"),
+        );
+        assert_eq!(result.err(), Some(PollError::TokenExpired));
+    }
+
+    #[test]
+    fn passive_valid_claude_credentials_remain_usable() {
+        let credentials = refresh_or_fallback_with(
+            claude_credentials(i64::MAX),
+            || true,
+            |_| panic!("valid credentials do not need CLI refresh"),
+            |_| panic!("credentials should only be read once"),
+            |_| panic!("the selected credential source should be preserved"),
+        )
+        .unwrap();
+        assert_eq!(credentials.access_token, "fixture-token");
+    }
+
+    #[test]
+    fn passive_claude_preserves_quota_without_generating_reset_timestamps() {
+        let reset = UNIX_EPOCH + Duration::from_secs(1_900_000_000);
+        let usage = fetch_claude_usage_with(
+            || true,
+            || {
+                Ok(Some(UsageData {
+                    session: UsageSection {
+                        percentage: 12.0,
+                        resets_at: None,
+                    },
+                    weekly: UsageSection {
+                        percentage: 34.0,
+                        resets_at: Some(reset),
+                    },
+                }))
+            },
+            || panic!("missing reset timestamps must not trigger model requests"),
+        )
+        .unwrap();
+        assert_eq!(usage.session.percentage, 12.0);
+        assert_eq!(usage.session.resets_at, None);
+        assert_eq!(usage.weekly.percentage, 34.0);
+        assert_eq!(usage.weekly.resets_at, Some(reset));
+    }
+
+    #[test]
+    fn passive_claude_unavailable_or_unauthorized_usage_never_calls_messages_api() {
+        for (response, expected) in [
+            (Ok(None), PollError::RequestFailed),
+            (Err(classify_http_status(401)), PollError::AuthRequired),
+            (Err(classify_http_status(403)), PollError::AuthRequired),
+        ] {
+            let result = fetch_claude_usage_with(
+                || true,
+                || response,
+                || panic!("a failed passive quota request must not generate a message"),
+            );
+            assert_eq!(result.unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn enabling_passive_mode_during_claude_request_prevents_messages_fallback() {
+        let passive = Cell::new(false);
+        let result = fetch_claude_usage_with(
+            || passive.get(),
+            || {
+                passive.set(true);
+                Ok(None)
+            },
+            || panic!("the policy must be rechecked after the quota request"),
+        );
+        assert_eq!(result.unwrap_err(), PollError::RequestFailed);
+    }
+
+    #[test]
+    fn non_passive_claude_can_still_use_the_opted_in_messages_fallback() {
+        let fallback_calls = Cell::new(0);
+        let result = fetch_claude_usage_with(
+            || false,
+            || Ok(None),
+            || {
+                fallback_calls.set(fallback_calls.get() + 1);
+                Ok(UsageData {
+                    session: UsageSection {
+                        percentage: 12.0,
+                        resets_at: None,
+                    },
+                    weekly: UsageSection::default(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(result.session.percentage, 12.0);
+        assert_eq!(fallback_calls.get(), 1);
+    }
 
     #[test]
     fn credential_signature_detects_same_length_rewrites_within_one_second() {

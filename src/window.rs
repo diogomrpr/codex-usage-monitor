@@ -25,6 +25,7 @@ use crate::native_interop::{
     TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
+use crate::privacy;
 use crate::provider_icons::{self, Provider};
 use crate::provider_poll;
 use crate::quota_refresh;
@@ -76,7 +77,6 @@ struct AppState {
     antigravity_session_text: String,
     antigravity_weekly_percent: f64,
     antigravity_weekly_text: String,
-    claude_code_available: bool,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -89,6 +89,8 @@ struct AppState {
 
     poll_interval_ms: u32,
     adaptive_refresh: bool,
+    passive_monitoring: bool,
+    updates_enabled: bool,
     monitor: provider_poll::Monitor,
     recovery_watch: Option<recovery_events::Watch>,
     recovery_debounce: recovery_events::Debounce,
@@ -132,6 +134,9 @@ const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_ANCHOR_LEFT: u16 = 34;
 const IDM_VERSION_ACTION: u16 = 31;
+const IDM_PASSIVE_MONITORING: u16 = 32;
+const IDM_ALLOW_UPDATES: u16 = 33;
+const IDM_PRIVACY_INFO: u16 = 35;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_DUTCH: u16 = 42;
@@ -324,20 +329,12 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-const SETTINGS_DIR: &str = "CodexUsage";
-const LEGACY_SETTINGS_DIR: &str = "ClaudeCodeUsageMonitor";
-
-fn appdata_path(directory: &str) -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(appdata).join(directory).join("settings.json")
-}
-
 fn settings_path() -> PathBuf {
-    appdata_path(SETTINGS_DIR)
+    privacy::settings_path()
 }
 
 fn legacy_settings_path() -> PathBuf {
-    appdata_path(LEGACY_SETTINGS_DIR)
+    privacy::legacy_settings_path()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,6 +433,10 @@ struct SettingsFile {
     poll_interval_ms: u32,
     #[serde(default = "default_adaptive_refresh")]
     adaptive_refresh: bool,
+    #[serde(default = "privacy::default_passive_monitoring")]
+    passive_monitoring: bool,
+    #[serde(default = "privacy::default_updates_enabled")]
+    updates_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
     #[serde(default)]
@@ -469,6 +470,8 @@ impl Default for SettingsFile {
             monitor_device: None,
             poll_interval_ms: default_poll_interval(),
             adaptive_refresh: true,
+            passive_monitoring: privacy::default_passive_monitoring(),
+            updates_enabled: privacy::default_updates_enabled(),
             language: None,
             appearance: Appearance::default(),
             last_update_check_unix: None,
@@ -512,42 +515,26 @@ fn default_show_usage_window() -> bool {
     true
 }
 
-fn load_settings(claude_code_available: bool) -> SettingsFile {
+fn load_settings() -> SettingsFile {
     let current_path = settings_path();
     let legacy_path = legacy_settings_path();
     let (settings, migrated) = load_settings_from_paths(&current_path, &legacy_path)
         .unwrap_or_else(|| (SettingsFile::default(), false));
-    let settings = normalize_settings(settings);
-    let (settings, claude_auto_disabled) =
-        apply_claude_code_availability(settings, claude_code_available);
-    if migrated || claude_auto_disabled {
+    let mut settings = normalize_settings(settings);
+    // main initializes these before any helper or provider side effects. Keep
+    // its fail-closed values if this file could not be read or parsed.
+    let preferences = privacy::preferences();
+    settings.passive_monitoring = preferences.passive_monitoring;
+    settings.updates_enabled = preferences.updates_enabled;
+    if migrated {
         save_settings(&settings);
-        if migrated {
-            diagnose::log(format!(
-                "migrated settings from {} to {}",
-                legacy_path.display(),
-                current_path.display()
-            ));
-        }
-        if claude_auto_disabled {
-            diagnose::log(
-                "disabled Claude Code monitoring because no CLI credentials are available",
-            );
-        }
+        diagnose::log(format!(
+            "migrated settings from {} to {}",
+            legacy_path.display(),
+            current_path.display()
+        ));
     }
     settings
-}
-
-fn apply_claude_code_availability(
-    mut settings: SettingsFile,
-    claude_code_available: bool,
-) -> (SettingsFile, bool) {
-    let disabled = settings.show_claude_code && !claude_code_available;
-    if disabled {
-        settings.show_claude_code = false;
-        settings = normalize_settings(settings);
-    }
-    (settings, disabled)
 }
 
 fn load_settings_from_paths(
@@ -570,9 +557,6 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     if !(POLL_1_MIN..=POLL_1_HOUR).contains(&settings.poll_interval_ms) {
         settings.poll_interval_ms = POLL_15_MIN;
     }
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
-        settings.show_codex = true;
-    }
     if !settings.show_session_window && !settings.show_weekly_window {
         settings.show_session_window = true;
     }
@@ -591,7 +575,13 @@ fn save_settings(settings: &SettingsFile) {
 }
 
 fn save_state_settings() {
-    let result = settings_store::save(&settings_path(), || {
+    if let Err(error) = try_save_state_settings() {
+        diagnose::log_error("unable to save settings", error);
+    }
+}
+
+fn try_save_state_settings() -> std::io::Result<()> {
+    settings_store::save(&settings_path(), || {
         let state = lock_state();
         state.as_ref().map(|s| SettingsFile {
             tray_offset: s.tray_offset,
@@ -600,6 +590,8 @@ fn save_state_settings() {
             monitor_device: s.monitor_device.clone(),
             poll_interval_ms: s.poll_interval_ms,
             adaptive_refresh: s.adaptive_refresh,
+            passive_monitoring: s.passive_monitoring,
+            updates_enabled: s.updates_enabled,
             language: s
                 .language_override
                 .map(|language| language.code().to_string()),
@@ -614,10 +606,7 @@ fn save_state_settings() {
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
         })
-    });
-    if let Err(error) = result {
-        diagnose::log_error("unable to save settings", error);
-    }
+    })
 }
 
 fn format_precise_reset_time(resets_at: Option<SystemTime>) -> Option<String> {
@@ -647,20 +636,6 @@ fn service_tooltip(
         parts.push(format!("7d {weekly_text}"));
     }
     format!("{service}: {}", parts.join(" | "))
-}
-
-fn claude_code_menu_label(
-    strings: Strings,
-    language: LanguageId,
-    claude_code_available: bool,
-) -> String {
-    if claude_code_available {
-        strings.claude_code_model.to_string()
-    } else if language == LanguageId::SimplifiedChinese {
-        "Claude Code（需登录 CLI）".to_string()
-    } else {
-        "Claude Code (CLI login required)".to_string()
-    }
 }
 
 struct QuotaAlert {
@@ -1044,6 +1019,9 @@ fn update_check_interval() -> Duration {
 }
 
 fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
+    if !privacy::updates_enabled() {
+        return false;
+    }
     let Some(last_update_check_unix) = last_update_check_unix else {
         return true;
     };
@@ -1052,6 +1030,12 @@ fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
 }
 
 fn schedule_auto_update_check(hwnd: HWND) {
+    if !privacy::updates_enabled() {
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_UPDATE_CHECK);
+        }
+        return;
+    }
     let delay_ms = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
@@ -1282,6 +1266,9 @@ fn version_action_label(
 }
 
 fn begin_update_check(hwnd: HWND, interactive: bool) {
+    if !privacy::updates_enabled() {
+        return;
+    }
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
     let (strings, install_channel) = {
         let mut state = lock_state();
@@ -1310,7 +1297,19 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
     std::thread::spawn(move || {
         let hwnd = send_hwnd.to_hwnd();
         let checked_at = now_unix_secs();
-        match updater::check_for_updates() {
+        let result = updater::check_for_updates();
+        // A request already in flight may finish after updates are disabled.
+        // Do not publish an available update or prompt to install it afterward.
+        if !privacy::updates_enabled() {
+            if let Some(s) = lock_state().as_mut() {
+                s.update_status = UpdateStatus::Idle;
+            }
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
+            }
+            return;
+        }
+        match result {
             Ok(UpdateCheckResult::UpToDate) => {
                 {
                     let mut state = lock_state();
@@ -1368,6 +1367,9 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
 }
 
 fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
+    if !privacy::updates_enabled() {
+        return;
+    }
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
     let strings = {
         let mut state = lock_state();
@@ -1415,6 +1417,9 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
 }
 
 fn begin_winget_update(hwnd: HWND) {
+    if !privacy::updates_enabled() {
+        return;
+    }
     let strings = {
         let state = lock_state();
         state.as_ref().map(|s| s.language.strings())
@@ -1936,8 +1941,9 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
-        let claude_code_available = poller::claude_code_credentials_available();
-        let settings = load_settings(claude_code_available);
+        // Provider selection is loaded before the first credential read. The
+        // scheduler discovers credentials only for explicitly enabled providers.
+        let settings = load_settings();
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -2012,7 +2018,6 @@ pub fn run() {
                 antigravity_session_text: "--".to_string(),
                 antigravity_weekly_percent: 0.0,
                 antigravity_weekly_text: "--".to_string(),
-                claude_code_available,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -2023,6 +2028,8 @@ pub fn run() {
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_refresh: settings.adaptive_refresh,
+                passive_monitoring: settings.passive_monitoring,
+                updates_enabled: settings.updates_enabled,
                 monitor: provider_poll::Monitor::new(
                     [
                         settings.show_claude_code,
@@ -2179,6 +2186,19 @@ fn update_quota_tooltips() {
                 let description =
                     s.monitor.services[id].description(SystemTime::now(), Instant::now(), chinese);
                 let mut text = format!("{name}\n{description}");
+                if id < 2
+                    && matches!(
+                        s.monitor.services[id].error,
+                        Some(
+                            poller::PollError::AuthRequired
+                                | poller::PollError::TokenExpired
+                                | poller::PollError::NoCredentials
+                        )
+                    )
+                {
+                    text.push('\n');
+                    text.push_str(s.language.strings().sign_in_required);
+                }
                 if s.monitor.services[id].error.is_some() && session == "!" {
                     text.push_str(if chinese {
                         "\n本服务本次未返回额度。"
@@ -2774,12 +2794,20 @@ fn complete_provider_poll(
                 0 => (
                     tray_icon::TrayIconKind::Claude,
                     strings.token_expired_title,
-                    strings.token_expired_body,
+                    if privacy::passive_monitoring() {
+                        strings.sign_in_required
+                    } else {
+                        strings.token_expired_body
+                    },
                 ),
                 1 => (
                     tray_icon::TrayIconKind::Codex,
                     strings.codex_token_expired_title,
-                    strings.codex_token_expired_body,
+                    if privacy::passive_monitoring() {
+                        strings.sign_in_required
+                    } else {
+                        strings.codex_token_expired_body
+                    },
                 ),
                 _ => (
                     tray_icon::TrayIconKind::Antigravity,
@@ -3414,6 +3442,9 @@ unsafe extern "system" fn wnd_proc(
                     request_poll(sh, true);
                 }
                 IDM_VERSION_ACTION => {
+                    if !privacy::updates_enabled() {
+                        return LRESULT(0);
+                    }
                     let (install_channel, release) = {
                         let state = lock_state();
                         match state.as_ref() {
@@ -3637,32 +3668,83 @@ unsafe extern "system" fn wnd_proc(
                     }
                     save_state_settings();
                 }
+                IDM_PASSIVE_MONITORING | IDM_ALLOW_UPDATES => {
+                    let policy = privacy::policy();
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            match id {
+                                IDM_PASSIVE_MONITORING if !policy.force_passive_monitoring => {
+                                    s.passive_monitoring = !s.passive_monitoring;
+                                }
+                                IDM_ALLOW_UPDATES if !policy.disable_updates => {
+                                    s.updates_enabled = !s.updates_enabled;
+                                    if !s.updates_enabled {
+                                        s.update_status = UpdateStatus::Idle;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            privacy::set_preferences(privacy::Preferences {
+                                passive_monitoring: s.passive_monitoring,
+                                updates_enabled: s.updates_enabled,
+                            });
+                        }
+                    }
+                    if let Err(error) = try_save_state_settings() {
+                        let strings = lock_state()
+                            .as_ref()
+                            .map(|s| s.language.strings())
+                            .unwrap_or_else(|| LanguageId::English.strings());
+                        show_error_message(
+                            hwnd,
+                            strings.settings,
+                            &format!("{}\n\n{error}", strings.settings_save_failed),
+                        );
+                    }
+                    schedule_auto_update_check(hwnd);
+                    if id == IDM_ALLOW_UPDATES && privacy::updates_enabled() {
+                        begin_update_check(hwnd, false);
+                    }
+                }
+                IDM_PRIVACY_INFO => {
+                    let strings = lock_state()
+                        .as_ref()
+                        .map(|s| s.language.strings())
+                        .unwrap_or_else(|| LanguageId::English.strings());
+                    let policy = privacy::policy();
+                    let mut message = strings.passive_monitoring_description.to_string();
+                    if policy.read_error {
+                        message.push_str("\n\n");
+                        message.push_str(strings.policy_error);
+                    } else if policy.force_passive_monitoring || policy.disable_updates {
+                        message.push_str("\n\n");
+                        message.push_str(strings.managed_policy);
+                    }
+                    show_info_message(hwnd, strings.privacy_information, &message);
+                }
                 IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             match id {
                                 IDM_MODEL_CLAUDE_CODE => {
-                                    if s.claude_code_available
-                                        && (s.show_codex
-                                            || s.show_antigravity
-                                            || !s.show_claude_code)
-                                    {
-                                        s.show_claude_code = !s.show_claude_code;
-                                    }
+                                    s.show_claude_code = !s.show_claude_code;
                                 }
                                 IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || s.show_antigravity || !s.show_codex {
-                                        s.show_codex = !s.show_codex;
-                                    }
+                                    s.show_codex = !s.show_codex;
                                 }
                                 IDM_MODEL_ANTIGRAVITY => {
-                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
-                                        s.show_antigravity = !s.show_antigravity;
-                                    }
+                                    s.show_antigravity = !s.show_antigravity;
                                 }
                                 _ => {}
                             }
+                            // Cancel queued work while the selection lock is
+                            // held, before settings I/O or any UI updates.
+                            s.monitor.configure(
+                                [s.show_claude_code, s.show_codex, s.show_antigravity],
+                                Instant::now(),
+                            );
                             s.session_text = "...".to_string();
                             s.weekly_text = "...".to_string();
                             s.codex_session_text = "...".to_string();
@@ -3786,7 +3868,6 @@ fn show_context_menu(hwnd: HWND) {
             update_status,
             widget_visible,
             show_claude_code,
-            claude_code_available,
             show_codex,
             show_antigravity,
             show_session_window,
@@ -3805,7 +3886,6 @@ fn show_context_menu(hwnd: HWND) {
                     s.update_status.clone(),
                     s.widget_visible,
                     s.show_claude_code,
-                    s.claude_code_available,
                     s.show_codex,
                     s.show_antigravity,
                     s.show_session_window,
@@ -3821,9 +3901,8 @@ fn show_context_menu(hwnd: HWND) {
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     true,
+                    false,
                     true,
-                    false,
-                    false,
                     false,
                     true,
                     true,
@@ -3894,11 +3973,8 @@ fn show_context_menu(hwnd: HWND) {
 
         // Models submenu
         let models_menu = CreatePopupMenu().unwrap();
-        let claude_label = claude_code_menu_label(strings, language, claude_code_available);
-        let claude_model = native_interop::wide_str(&claude_label);
-        let claude_flags = if !claude_code_available {
-            MF_GRAYED
-        } else if show_claude_code {
+        let claude_model = native_interop::wide_str(strings.claude_code_model);
+        let claude_flags = if show_claude_code {
             MF_CHECKED
         } else {
             MENU_ITEM_FLAGS(0)
@@ -4198,6 +4274,51 @@ fn show_context_menu(hwnd: HWND) {
         // Settings submenu
         let settings_menu = CreatePopupMenu().unwrap();
 
+        let policy = privacy::policy();
+        for (id, label, checked, managed) in [
+            (
+                IDM_PASSIVE_MONITORING,
+                strings.passive_monitoring,
+                privacy::passive_monitoring(),
+                policy.force_passive_monitoring,
+            ),
+            (
+                IDM_ALLOW_UPDATES,
+                strings.allow_updates,
+                privacy::updates_enabled(),
+                policy.disable_updates,
+            ),
+        ] {
+            let label = if managed {
+                format!("{label} ({})", strings.managed_policy)
+            } else {
+                label.to_string()
+            };
+            let wide = native_interop::wide_str(&label);
+            let mut flags = if checked {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            if managed {
+                flags |= MF_GRAYED;
+            }
+            let _ = AppendMenuW(
+                settings_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(wide.as_ptr()),
+            );
+        }
+        let privacy_label = native_interop::wide_str(strings.privacy_information);
+        let _ = AppendMenuW(
+            settings_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_PRIVACY_INFO as usize,
+            PCWSTR::from_raw(privacy_label.as_ptr()),
+        );
+        let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
+
         let startup_str = native_interop::wide_str(strings.start_with_windows);
         let startup_flags = if is_startup_enabled() {
             MF_CHECKED
@@ -4331,10 +4452,11 @@ fn show_context_menu(hwnd: HWND) {
         let version_label =
             version_action_label(strings, language, install_channel, &update_status);
         let version_str = native_interop::wide_str(&version_label);
-        let version_flags = if matches!(
-            update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
+        let version_flags = if !privacy::updates_enabled()
+            || matches!(
+                update_status,
+                UpdateStatus::Checking | UpdateStatus::Applying
+            ) {
             MF_GRAYED
         } else {
             MENU_ITEM_FLAGS(0)
@@ -4810,19 +4932,16 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_claude_cli_has_an_explicit_menu_label() {
-        assert_eq!(
-            claude_code_menu_label(
-                LanguageId::SimplifiedChinese.strings(),
-                LanguageId::SimplifiedChinese,
-                false,
-            ),
-            "Claude Code（需登录 CLI）"
-        );
-        assert_eq!(
-            claude_code_menu_label(LanguageId::English.strings(), LanguageId::English, true),
-            "Claude Code"
-        );
+    fn privacy_preferences_migrate_and_round_trip() {
+        let mut settings: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert!(settings.passive_monitoring);
+        assert!(settings.updates_enabled);
+        settings.passive_monitoring = false;
+        settings.updates_enabled = false;
+        let restored: SettingsFile =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(!restored.passive_monitoring);
+        assert!(!restored.updates_enabled);
     }
 
     fn test_settings_json(language: &str) -> String {
@@ -5015,19 +5134,18 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_claude_cli_is_disabled_without_disabling_codex() {
-        let settings = SettingsFile {
-            show_claude_code: true,
-            show_codex: false,
-            show_antigravity: false,
-            ..SettingsFile::default()
-        };
-
-        let (settings, changed) = apply_claude_code_availability(settings, false);
-
-        assert!(changed);
-        assert!(!settings.show_claude_code);
-        assert!(settings.show_codex);
+    fn startup_preserves_explicit_provider_selection_without_credential_discovery() {
+        for show_claude_code in [true, false] {
+            let settings = normalize_settings(SettingsFile {
+                show_claude_code,
+                show_codex: false,
+                show_antigravity: false,
+                ..SettingsFile::default()
+            });
+            assert_eq!(settings.show_claude_code, show_claude_code);
+            assert!(!settings.show_codex);
+            assert!(!settings.show_antigravity);
+        }
     }
 
     #[test]
