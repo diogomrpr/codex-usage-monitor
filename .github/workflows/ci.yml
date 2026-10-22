@@ -42,9 +42,12 @@ jobs:
       - name: Prepare verifiable package
         shell: pwsh
         run: ./scripts/package-release.ps1
-      - name: Test managed installation on the disposable runner
+      - name: Test installation and upgrades in Windows PowerShell 5.1
+        shell: powershell
+        run: ./scripts/test-managed-install.ps1 -PackageDirectory ./dist -ExpectedPSEdition Desktop
+      - name: Test installation and upgrades in PowerShell 7
         shell: pwsh
-        run: ./scripts/test-managed-install.ps1 -PackageDirectory ./dist
+        run: ./scripts/test-managed-install.ps1 -PackageDirectory ./dist -ExpectedPSEdition Core
       - name: Upload Windows package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

@@ -102,7 +102,7 @@ function Assert-FileChecksum {
 
 function Read-InstallationSettings {
     if (Test-Path -LiteralPath $SettingsPath) {
-        $settings = Get-Content -Raw -LiteralPath $SettingsPath | ConvertFrom-Json
+        $settings = Get-Content -Raw -Encoding UTF8 -LiteralPath $SettingsPath | ConvertFrom-Json
         if ($null -eq $settings -or $settings -isnot [pscustomobject]) {
             throw 'Existing settings must be a JSON object. Correct the settings before installing.'
         }
@@ -257,7 +257,9 @@ try {
         try {
             [IO.File]::WriteAllText($SettingsTempPath, ($Settings | ConvertTo-Json -Depth 32), [Text.UTF8Encoding]::new($false))
             if (Test-Path -LiteralPath $SettingsPath) {
-                [IO.File]::Replace($SettingsTempPath, $SettingsPath, $null)
+                # PowerShell converts $null to an empty .NET string, which is
+                # an invalid backup path. Pass a true null and keep the atomic replace.
+                [IO.File]::Replace($SettingsTempPath, $SettingsPath, [System.Management.Automation.Language.NullString]::Value)
             }
             else {
                 [IO.File]::Move($SettingsTempPath, $SettingsPath)

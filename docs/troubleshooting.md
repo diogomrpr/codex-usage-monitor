@@ -41,6 +41,12 @@ The log may also include local paths, launch arguments, and WSL distribution nam
 
 Direct installations and portable copies download only the exact `codex-usage.exe` asset and verify it against `codex-usage.exe.sha256` from the same GitHub Release. The updater keeps the previous EXE until the downloaded version has been installed and restarted successfully. If restart fails, the old EXE is restored.
 
+## Installer reports "The path is not of a legal form"
+
+Older preview installers passed an empty backup path to .NET when replacing an existing settings file. This affected upgrades even when the package path and checksums were correct. The installer now passes a true null backup path and explicitly reads UTF-8 settings so Windows PowerShell 5.1 preserves non-ASCII preferences.
+
+Use the corrected package and rerun its installer with the approved hashes; no uninstall or settings reset is needed. The failed upgrade may leave the monitor stopped after restoring its previous executable. A successful retry updates the installation and starts the monitor normally.
+
 ## Widget disappears after a display change, or covers the clock
 
 Display changes now check that Windows accepted the new taskbar attachment before saving the selected display. A rejected move keeps the previous attachment and reports the failure. Placement uses the selected taskbar's actual client coordinates, including displays positioned to the left of or above the primary screen.

@@ -2,7 +2,10 @@
 # No provider credentials are loaded and the monitor UI is never launched.
 [CmdletBinding()]
 param(
-    [string]$PackageDirectory = (Join-Path $PSScriptRoot '..\dist')
+    [string]$PackageDirectory = (Join-Path $PSScriptRoot '..\dist'),
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Desktop', 'Core')]
+    [string]$ExpectedPSEdition
 )
 
 Set-StrictMode -Version Latest
@@ -12,6 +15,18 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
     $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
     throw 'This installation test requires a disposable GitHub-hosted Windows runner.'
 }
+
+if ($PSVersionTable.PSEdition -ne $ExpectedPSEdition) {
+    throw "Expected PowerShell edition $ExpectedPSEdition, got $($PSVersionTable.PSEdition)."
+}
+if ($ExpectedPSEdition -eq 'Desktop' -and
+    ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1)) {
+    throw 'The Windows PowerShell regression must run under version 5.1.'
+}
+if ($ExpectedPSEdition -eq 'Core' -and $PSVersionTable.PSVersion.Major -lt 7) {
+    throw 'The PowerShell Core regression must run under version 7 or newer.'
+}
+Write-Output "Testing fresh installation and upgrades under $($PSVersionTable.PSEdition) PowerShell $($PSVersionTable.PSVersion) ($PSHOME)."
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -39,6 +54,35 @@ function Read-ApprovedPackageHash([string]$FileName) {
 
 function Write-Utf8([string]$Path, [string]$Content) {
     [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
+}
+
+function Invoke-ApprovedInstallation([switch]$ManagedProfile) {
+    $parameters = @{
+        SourcePath = $ExecutablePath
+        ExpectedSha256 = $ExecutableHash
+        ExpectedUninstallerSha256 = $UninstallerHash
+        NoLaunch = $true
+    }
+    if ($ManagedProfile) { $parameters.Managed = $true }
+    # Deliberately invoke in this host. A pwsh-only child would miss Windows
+    # PowerShell 5.1's .NET string/null binding and default text encoding.
+    & $InstallerPath @parameters
+
+    $processes = @(Get-CimInstance Win32_Process -Filter "Name='codex-usage.exe'")
+    Assert-True ($processes.Count -eq 0) '-NoLaunch started the monitor.'
+    Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $TargetPath).Hash -eq $ExecutableHash) 'Installation changed the approved executable.'
+    $temporarySettings = @(Get-ChildItem -LiteralPath $SettingsDirectory -Filter 'settings-*.tmp')
+    Assert-True ($temporarySettings.Count -eq 0) 'Installation left a temporary settings file.'
+}
+
+function Assert-PreservedPreferences($Settings, [string]$Scenario) {
+    Assert-True ($Settings.tray_offset -eq 42) "$Scenario changed the saved widget position."
+    Assert-True ($Settings.widget_visible -is [bool] -and -not $Settings.widget_visible) "$Scenario changed the saved widget visibility."
+    Assert-True ($Settings.show_codex -is [bool] -and $Settings.show_codex) "$Scenario changed the enabled provider."
+    Assert-True ($Settings.show_claude_code -is [bool] -and -not $Settings.show_claude_code) "$Scenario changed a disabled provider."
+    Assert-True ($Settings.show_antigravity -is [bool] -and -not $Settings.show_antigravity) "$Scenario changed a disabled provider."
+    Assert-True ($Settings.future_preference.note -ceq $UnicodePreference) "$Scenario did not preserve a UTF-8 preference."
+    Assert-True ($Settings.future_preference.retained -is [bool] -and $Settings.future_preference.retained) "$Scenario lost an unrelated nested preference."
 }
 
 function Assert-UpdatePolicyExit([int]$Expected, [string]$Scenario) {
@@ -105,8 +149,7 @@ Assert-True ($existingProcesses.Count -eq 0) 'A running monitor must not be chan
 # removed below, including when the installer or an assertion fails partway.
 $OwnsPolicyDirectory = $false
 try {
-    & $InstallerPath -SourcePath $ExecutablePath -ExpectedSha256 $ExecutableHash `
-        -ExpectedUninstallerSha256 $UninstallerHash -Managed -NoLaunch
+    Invoke-ApprovedInstallation -ManagedProfile
 
     Assert-True (Test-Path -LiteralPath $TargetPath -PathType Leaf) 'Managed installation did not install the executable.'
     Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $TargetPath).Hash -eq $ExecutableHash) 'The installed executable differs from the approved package.'
@@ -117,11 +160,43 @@ try {
     $launchedProcesses = @(Get-CimInstance Win32_Process -Filter "Name='codex-usage.exe'")
     Assert-True ($launchedProcesses.Count -eq 0) '-NoLaunch started the monitor.'
 
-    $InstalledSettings = [IO.File]::ReadAllText($SettingsPath)
-    $settings = $InstalledSettings | ConvertFrom-Json
+    $settings = [IO.File]::ReadAllText($SettingsPath) | ConvertFrom-Json
     Assert-True ($settings.passive_monitoring -is [bool] -and $settings.passive_monitoring) 'Managed installation must select passive monitoring.'
     Assert-True ($settings.updates_enabled -is [bool] -and -not $settings.updates_enabled) 'Managed installation must disable updates.'
     Assert-UpdatePolicyExit 1 'managed installation disables updates'
+
+    # Seed a real existing settings file, then run the full installer again.
+    # Fresh installs use File.Move and cannot reproduce the File.Replace bug.
+    # Codepoints keep the script itself ASCII so 5.1's source-file decoding does
+    # not influence the UTF-8 settings round-trip assertion.
+    $UnicodePreference = -join (@(0x7BA1, 0x7406, 0x8A2D, 0x5B9A, 0x0020, 0x00E9) | ForEach-Object { [char]$_ })
+    $OriginalPreferences = [ordered]@{
+        passive_monitoring = $false
+        updates_enabled = $true
+        tray_offset = 42
+        widget_visible = $false
+        show_codex = $true
+        show_claude_code = $false
+        show_antigravity = $false
+        future_preference = [ordered]@{ note = $UnicodePreference; retained = $true }
+    }
+    Write-Utf8 $SettingsPath ($OriginalPreferences | ConvertTo-Json -Depth 32)
+    Invoke-ApprovedInstallation
+    $settings = [IO.File]::ReadAllText($SettingsPath) | ConvertFrom-Json
+    Assert-True ($settings.passive_monitoring -is [bool] -and -not $settings.passive_monitoring) 'Ordinary upgrade must preserve an explicit passive-monitoring preference.'
+    Assert-True ($settings.updates_enabled -is [bool] -and $settings.updates_enabled) 'Ordinary upgrade must preserve an explicit update preference.'
+    Assert-PreservedPreferences $settings 'Ordinary upgrade'
+    Assert-UpdatePolicyExit 0 'ordinary upgrade preserves explicitly enabled updates'
+
+    foreach ($attempt in 1..2) {
+        Invoke-ApprovedInstallation -ManagedProfile
+        $settings = [IO.File]::ReadAllText($SettingsPath) | ConvertFrom-Json
+        Assert-True ($settings.passive_monitoring -is [bool] -and $settings.passive_monitoring) 'Managed upgrade must override the previous passive-monitoring preference.'
+        Assert-True ($settings.updates_enabled -is [bool] -and -not $settings.updates_enabled) 'Managed upgrade must override the previous update preference.'
+        Assert-PreservedPreferences $settings "Managed upgrade $attempt"
+        Assert-UpdatePolicyExit 1 "managed upgrade $attempt disables updates"
+    }
+    $InstalledSettings = [IO.File]::ReadAllText($SettingsPath)
 
     $settings.updates_enabled = $true
     Write-Utf8 $SettingsPath ($settings | ConvertTo-Json -Depth 32)
@@ -150,7 +225,7 @@ try {
     Assert-True (Test-Path -LiteralPath $SettingsPath -PathType Leaf) 'Ordinary uninstallation removed settings.'
     Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $SettingsPath).Hash -eq $PreservedSettingsHash) 'Uninstallation modified the preserved settings.'
     Assert-True ((Get-Content -Raw -LiteralPath $PolicyPath) -ceq '{"disable_updates":true}') 'Uninstallation modified machine policy.'
-    Write-Output 'Managed package installation, policy helper, and settings-preserving uninstallation passed.'
+    Write-Output "Fresh installation, ordinary/managed upgrades with UTF-8 settings, policy helper, and settings-preserving uninstallation passed under $ExpectedPSEdition PowerShell $($PSVersionTable.PSVersion)."
 }
 finally {
     # A failed -NoLaunch assertion can leave this test's executable running.
